@@ -1174,32 +1174,61 @@ async function useSource(kind) {
   note.textContent = '';
   note.classList.remove('error');
   if (kind === 'file') { stopLive(); return; }
-  if (!navigator.mediaDevices) {
-    note.textContent = 'Захват звука доступен только по https или с localhost.';
-    note.classList.add('error');
+  const fail = (text) => { note.textContent = text; note.classList.add('error'); };
+  if (!window.isSecureContext || !navigator.mediaDevices) {
+    fail('Захват звука доступен только по https или на localhost.');
     return;
   }
+  if (kind === 'tab' && !navigator.mediaDevices.getDisplayMedia) {
+    fail('Этот браузер не умеет захватывать звук вкладки (на телефонах такого нет). Попробуй микрофон или Chrome/Edge на компьютере.');
+    return;
+  }
+  // Без обработки речи: шумодав и автогромкость портят музыку
+  const clean = { echoCancellation: false, noiseSuppression: false, autoGainControl: false };
   try {
     let stream;
-    const constraints = { echoCancellation: false, noiseSuppression: false, autoGainControl: false };
     if (kind === 'mic') {
-      stream = await navigator.mediaDevices.getUserMedia({ audio: constraints });
+      stream = await navigator.mediaDevices.getUserMedia({ audio: clean });
     } else {
-      stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: constraints, systemAudio: 'include' });
-      stream.getVideoTracks().forEach((t) => t.stop()); // картинка не нужна, только звук
-      if (!stream.getAudioTracks().length) throw new Error('noaudio');
+      note.textContent = 'В окне выбора открой «Вкладка Chrome», выбери вкладку с музыкой и проверь, что включено «Поделиться звуком».';
+      stream = await navigator.mediaDevices.getDisplayMedia({
+        video: { displaySurface: 'browser' },  // по умолчанию предлагаем вкладку — у неё звук есть всегда
+        audio: { ...clean, suppressLocalAudioPlayback: false },
+        systemAudio: 'include',                // для «Весь экран» — звук системы
+        selfBrowserSurface: 'exclude',         // эту вкладку выбирать бессмысленно
+        surfaceSwitching: 'include',
+      });
+      const video = stream.getVideoTracks()[0];
+      const surface = video?.getSettings().displaySurface;
+      if (!stream.getAudioTracks().length) {
+        stream.getTracks().forEach((t) => t.stop());
+        throw Object.assign(new Error('noaudio'), { surface });
+      }
+      // Картинка не нужна — экономим ресурсы, звук продолжает идти
+      if (video) video.enabled = false;
     }
     startLive(stream, kind);
     note.textContent = kind === 'mic'
       ? 'Слушаю микрофон. Нажми ■ на деке, чтобы вернуться к плейлисту.'
-      : 'Слушаю звук вкладки. Остановить можно кнопкой ■ или «Закрыть доступ» в браузере.';
+      : 'Слушаю звук. Остановить можно кнопкой ■ на деке или «Закрыть доступ» в браузере.';
   } catch (e) {
-    note.textContent = e.message === 'noaudio'
-      ? 'Звук не передан: в окне выбора включи «Поделиться звуком» (Chrome/Edge — вкладка или весь экран).'
-      : e.name === 'NotAllowedError'
-        ? 'Доступ не выдан. Разреши его в браузере и попробуй снова.'
-        : 'Не получилось: ' + e.message;
-    note.classList.add('error');
+    if (e.message === 'noaudio') {
+      fail(e.surface === 'window'
+        ? 'Ты выбрал отдельное окно — Windows не отдаёт его звук. Выбери вкладку браузера или «Весь экран» и включи «Поделиться системным звуком».'
+        : e.surface === 'monitor'
+          ? 'Звук не передан: при выборе «Весь экран» включи внизу «Поделиться системным звуком» (работает в Windows).'
+          : 'Звук не передан: в окне выбора включи «Поделиться звуком вкладки». В Brave и других браузерах его может не быть — тогда попробуй Chrome или Edge.');
+    } else if (e.name === 'NotAllowedError') {
+      fail(kind === 'mic'
+        ? 'Доступ к микрофону запрещён. Нажми на значок слева от адреса сайта, разреши микрофон и попробуй снова.'
+        : 'Захват отменён или запрещён браузером. Попробуй ещё раз и выбери вкладку с музыкой.');
+    } else if (e.name === 'NotFoundError') {
+      fail('Микрофон не найден. Подключи его и попробуй снова.');
+    } else if (e.name === 'NotReadableError') {
+      fail('Микрофон занят другим приложением или заблокирован системой (Параметры Windows → Конфиденциальность → Микрофон).');
+    } else {
+      fail('Не получилось: ' + (e.message || e.name));
+    }
   }
 }
 
@@ -1213,7 +1242,8 @@ function startLive(stream, kind) {
   state.source = kind;
   actx.resume();
   resetTempo();
-  stream.getAudioTracks()[0].addEventListener('ended', () => { if (liveStream === stream) stopLive(); });
+  // «Закрыть доступ» в браузере завершает дорожки — возвращаемся к плейлисту
+  stream.getTracks().forEach((t) => t.addEventListener('ended', () => { if (liveStream === stream) stopLive(); }));
   updateSourceUI();
   setNowPlayingLive();
 }

@@ -1,0 +1,12 @@
+# Настройки редактора и инструментов
+.claude/
+.vscode/
+.idea/
+
+# Системный мусор
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Зависимости, если появятся
+node_modules/

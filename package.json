@@ -1,0 +1,20 @@
+{
+  "name": "music-visualizer",
+  "private": true,
+  "type": "module",
+  "description": "Neon music visualizer player: static frontend + Vercel Functions, data in Turso, audio in Vercel Blob",
+  "scripts": {
+    "dev": "node dev-server.js",
+    "build:blob-client": "esbuild node_modules/@vercel/blob/dist/client.js --bundle --format=esm --platform=browser --minify --outfile=vendor/blob-client.js"
+  },
+  "dependencies": {
+    "@libsql/client": "0.18.0",
+    "@vercel/blob": "2.8.0"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

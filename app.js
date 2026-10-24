@@ -861,9 +861,14 @@ function probeDuration(file) {
   });
 }
 
-// ---------- Хранилище плейлиста (IndexedDB) ----------
-// Сами аудиофайлы и обложки лежат в браузере, поэтому плейлист переживает перезапуск
-const DB = {
+// ---------- Хранилище плейлиста ----------
+// Два режима, выбираются автоматически при запуске:
+//  • «облако» — если сервер отвечает на /api/health (деплой на Vercel): метаданные треков и настройки
+//    в базе Turso, сами аудиофайлы и обложки в Vercel Blob. Ключи живут только на сервере;
+//  • «браузер» — IndexedDB, как раньше (GitHub Pages, простой локальный сервер).
+
+// Локальная база браузера
+const LocalDB = {
   conn: null,
   open() {
     this.conn ??= new Promise((resolve, reject) => {
@@ -893,6 +898,124 @@ const toRecord = ({ id, added, name, title, artist, album, duration, file, cover
   ({ id, added, name, title, artist, album, duration, file, cover });
 const withUrls = (rec) => ({ ...rec, coverUrl: rec.cover ? URL.createObjectURL(rec.cover) : '' });
 
+// Анонимный пользователь: случайный UUID, который браузер помнит и присылает серверу
+function uuid4() {
+  if (crypto.randomUUID) return crypto.randomUUID();
+  const b = crypto.getRandomValues(new Uint8Array(16));
+  b[6] = (b[6] & 0x0f) | 0x40;
+  b[8] = (b[8] & 0x3f) | 0x80;
+  const h = [...b].map((x) => x.toString(16).padStart(2, '0')).join('');
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
+}
+const userId = (() => {
+  try {
+    let id = localStorage.getItem('mv-user');
+    if (!id) { id = uuid4(); localStorage.setItem('mv-user', id); }
+    return id;
+  } catch {
+    return uuid4();
+  }
+})();
+
+let cloud = false;
+
+async function detectCloud() {
+  try {
+    const r = await fetch('/api/health', { cache: 'no-store' });
+    if (!r.ok) return false;
+    return (await r.json()).cloud === true;
+  } catch {
+    return false;
+  }
+}
+
+async function api(path, options = {}) {
+  const res = await fetch(path, {
+    ...options,
+    headers: { 'content-type': 'application/json', 'x-user-id': userId, ...options.headers },
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || `Сервер ответил ${res.status}`);
+  return data;
+}
+
+// Браузерный клиент Vercel Blob собран в vendor/ и грузится только в облачном режиме
+let blobClient = null;
+const safeName = (s) => (s.normalize('NFKD').replace(/[^\w.-]+/g, '_').replace(/_+/g, '_').slice(-80) || 'file');
+
+async function uploadBlob(file, path, onProgress) {
+  blobClient ??= import('./vendor/blob-client.js');
+  const { upload } = await blobClient;
+  const blob = await upload(`u/${userId}/${path}`, file, {
+    access: 'public',
+    handleUploadUrl: '/api/upload',
+    clientPayload: userId,
+    contentType: file.type || undefined,
+    multipart: file.size > 20 * 1024 * 1024,
+    onUploadProgress: onProgress && ((e) => onProgress(e.percentage)),
+  });
+  return blob.url;
+}
+
+// Единый интерфейс плейлиста для обоих режимов
+const Library = {
+  async load() {
+    if (!cloud) return (await LocalDB.all()).sort((a, b) => a.added - b.added).map(withUrls);
+    const { tracks: list } = await api('/api/tracks');
+    return list.map((t, i) => ({ ...t, added: i, coverUrl: t.coverUrl || '', file: null }));
+  },
+
+  // В облаке: файл и обложка уходят в Blob, затем запись — в Turso
+  async add(rec) {
+    if (!cloud) { await LocalDB.put(toRecord(rec)); return; }
+    rec.status = 'uploading';
+    rec.progress = 0;
+    renderPlaylist();
+    try {
+      const base = `${rec.id}/${safeName(rec.name)}`;
+      let shown = 0;
+      rec.audioUrl = await uploadBlob(rec.file, base, (p) => {
+        rec.progress = p;
+        if (p - shown >= 5 || p >= 100) { shown = p; renderPlaylist(); }
+      });
+      if (rec.cover) {
+        const ext = rec.cover.type === 'image/png' ? 'png' : 'jpg';
+        rec.remoteCover = await uploadBlob(new File([rec.cover], `cover.${ext}`, { type: rec.cover.type || 'image/jpeg' }), `${rec.id}/cover.${ext}`);
+      }
+      if (rec.removed) return;
+      await api('/api/tracks', {
+        method: 'POST',
+        body: JSON.stringify({
+          id: rec.id, name: rec.name, title: rec.title, artist: rec.artist, album: rec.album,
+          duration: rec.duration || null, audioUrl: rec.audioUrl, coverUrl: rec.remoteCover || null,
+        }),
+      });
+      rec.status = 'saved';
+    } catch (e) {
+      console.warn('Не удалось сохранить трек в облако', e);
+      rec.status = 'error';
+      rec.error = e.message;
+    }
+    renderPlaylist();
+  },
+
+  async updateDuration(rec) {
+    if (!cloud) return LocalDB.put(toRecord(rec));
+    if (rec.status !== 'uploading' && rec.status !== 'error') {
+      return api('/api/tracks', { method: 'PATCH', body: JSON.stringify({ id: rec.id, duration: rec.duration }) });
+    }
+  },
+
+  remove(rec) {
+    rec.removed = true;
+    return cloud ? api(`/api/tracks?id=${encodeURIComponent(rec.id)}`, { method: 'DELETE' }) : LocalDB.del(rec.id);
+  },
+
+  clear() {
+    return cloud ? api('/api/tracks?all=1', { method: 'DELETE' }) : LocalDB.clear();
+  },
+};
+
 // ---------- Плейлист ----------
 let tracks = [];
 let cur = -1;
@@ -902,6 +1025,8 @@ let objectUrl = null;
 async function addFiles(list) {
   const files = [...list].filter(isAudioFile);
   if (!files.length) return;
+  // Сначала быстро показываем треки в плейлисте (теги читаются локально)…
+  const added = [];
   for (const file of files) {
     const tags = await readTags(file);
     const fallback = tagsFromName(file.name);
@@ -917,12 +1042,16 @@ async function addFiles(list) {
       cover: tags.cover || null,
     });
     tracks.push(rec);
+    added.push(rec);
     renderPlaylist();
     // Первый добавленный трек сразу заводим, если ничего не играет
     if (!state.loaded && !isLive()) playIndex(tracks.length - 1);
-    try { await DB.put(toRecord(rec)); } catch (e) { console.warn('Не удалось сохранить трек в браузере', e); }
   }
   updateDropzone();
+  // …а потом по очереди сохраняем: в облако или в браузер
+  for (const rec of added) {
+    try { await Library.add(rec); } catch (e) { console.warn('Не удалось сохранить трек', e); }
+  }
 }
 
 function playIndex(i, autoplay = true) {
@@ -931,8 +1060,9 @@ function playIndex(i, autoplay = true) {
   if (isLive()) stopLive();
   cur = i;
   if (objectUrl) URL.revokeObjectURL(objectUrl);
-  objectUrl = URL.createObjectURL(t.file);
-  audio.src = objectUrl;
+  // Локальный файл (если он есть в этой вкладке) играет мгновенно, иначе — потоком из облака
+  objectUrl = t.file ? URL.createObjectURL(t.file) : null;
+  audio.src = objectUrl || t.audioUrl;
   state.loaded = true;
   resetTempo();
   setNowPlaying(t);
@@ -966,8 +1096,8 @@ function prev() {
 
 async function removeTrack(i) {
   const [t] = tracks.splice(i, 1);
-  if (t.coverUrl) URL.revokeObjectURL(t.coverUrl);
-  DB.del(t.id).catch(() => {});
+  if (t.coverUrl.startsWith('blob:')) URL.revokeObjectURL(t.coverUrl);
+  Library.remove(t).catch((e) => console.warn('Не удалось удалить трек', e));
   if (i === cur) {
     const wasPlaying = !audio.paused;
     cur = -1;
@@ -981,12 +1111,13 @@ async function removeTrack(i) {
 }
 
 async function clearPlaylist() {
-  if (!tracks.length || !confirm('Очистить плейлист? Треки удалятся из памяти браузера.')) return;
-  tracks.forEach((t) => t.coverUrl && URL.revokeObjectURL(t.coverUrl));
+  const where = cloud ? 'из облака' : 'из памяти браузера';
+  if (!tracks.length || !confirm(`Очистить плейлист? Треки удалятся ${where}.`)) return;
+  tracks.forEach((t) => { t.removed = true; if (t.coverUrl.startsWith('blob:')) URL.revokeObjectURL(t.coverUrl); });
   tracks = [];
   cur = -1;
   stopFile();
-  DB.clear().catch(() => {});
+  Library.clear().catch((e) => console.warn('Не удалось очистить плейлист', e));
   renderPlaylist();
   updateDropzone();
 }
@@ -1000,11 +1131,17 @@ function stopFile() {
   if (!isLive()) clearNowPlaying();
 }
 
+function trackSubtitle(t) {
+  if (t.status === 'uploading') return `<span class="pl-status">Загрузка в облако… ${Math.round(t.progress || 0)}%</span>`;
+  if (t.status === 'error') return `<span class="pl-status err" title="${esc(t.error || '')}">Не сохранён в облако — только в этой вкладке</span>`;
+  return esc(t.artist || 'Неизвестный исполнитель');
+}
+
 function renderPlaylist() {
   $('#plList').innerHTML = tracks.map((t, i) => `
     <li class="pl-item${i === cur ? ' current' : ''}" data-i="${i}">
-      <div class="pl-thumb">${t.coverUrl ? `<img src="${t.coverUrl}" alt="">` : NOTE_SVG}<div class="pl-eq"><i></i><i></i><i></i></div></div>
-      <div class="pl-meta"><span class="pl-title">${esc(t.title)}</span><span class="pl-artist">${esc(t.artist || 'Неизвестный исполнитель')}</span></div>
+      <div class="pl-thumb">${t.coverUrl ? `<img src="${esc(t.coverUrl)}" alt="" crossorigin="anonymous">` : NOTE_SVG}<div class="pl-eq"><i></i><i></i><i></i></div></div>
+      <div class="pl-meta"><span class="pl-title">${esc(t.title)}</span><span class="pl-artist">${trackSubtitle(t)}</span></div>
       <span class="pl-dur">${t.duration ? fmt(t.duration) : ''}</span>
       <button class="pl-del" data-del="${i}" title="Убрать из плейлиста" aria-label="Убрать из плейлиста">${X_SVG}</button>
     </li>`).join('');
@@ -1034,7 +1171,12 @@ function setCover(url) {
   img.hidden = !url;
   if (url) img.src = url; else img.removeAttribute('src');
   coverArt = null;
-  if (url) { const im = new Image(); im.src = url; coverArt = im; }
+  if (url) {
+    const im = new Image();
+    im.crossOrigin = 'anonymous'; // обложка из облака рисуется на канвасе в режиме Circle
+    im.src = url;
+    coverArt = im;
+  }
 }
 
 function setNowPlaying(t) {
@@ -1119,7 +1261,7 @@ audio.addEventListener('loadedmetadata', () => {
   if (t && !t.duration && isFinite(audio.duration)) {
     t.duration = audio.duration;
     renderPlaylist();
-    DB.put(toRecord(t)).catch(() => {});
+    Promise.resolve(Library.updateDuration(t)).catch(() => {});
   }
 });
 
@@ -1333,18 +1475,60 @@ function buildEq() {
   $$('#eqPresets .chip').forEach((c) => c.addEventListener('click', () => applyEqPreset(c.dataset.eq)));
 }
 
+let eqCustomName = ''; // название пресета сообщества, если он применён
+
 function setEq(i, v) {
   v = Math.max(-12, Math.min(12, v));
   if (v === state.eq[i]) return;
   state.eq[i] = v;
   state.eqPreset = Object.keys(EQ_PRESETS).find((k) => EQ_PRESETS[k].gains.every((x, j) => x === state.eq[j])) || 'custom';
+  eqCustomName = '';
   applyEq();
 }
 function applyEqPreset(key) {
   state.eq = [...EQ_PRESETS[key].gains];
   state.eqPreset = key;
+  eqCustomName = '';
   applyEq();
 }
+
+// ---------- Пресеты сообщества (общая таблица в Turso) ----------
+let sharedPresets = [];
+
+async function loadSharedPresets() {
+  const box = $('#sharedPresets');
+  try {
+    ({ presets: sharedPresets } = await api('/api/presets'));
+  } catch (e) {
+    box.innerHTML = `<span class="shared-empty">Не удалось загрузить: ${esc(e.message)}</span>`;
+    return;
+  }
+  box.innerHTML = sharedPresets.length
+    ? sharedPresets.map((p, i) => `<button class="chip ghost" data-shared="${i}" title="${p.gains.map((g) => (g > 0 ? '+' : '') + g).join(' · ')} дБ">${esc(p.name)}</button>`).join('')
+    : '<span class="shared-empty">Пока пусто — поделись первым</span>';
+}
+
+$('#sharedPresets').addEventListener('click', (e) => {
+  const chip = e.target.closest('[data-shared]');
+  if (!chip) return;
+  const p = sharedPresets[+chip.dataset.shared];
+  state.eq = p.gains.map(Number);
+  state.eqPreset = Object.keys(EQ_PRESETS).find((k) => EQ_PRESETS[k].gains.every((x, j) => x === state.eq[j])) || 'custom';
+  eqCustomName = state.eqPreset === 'custom' ? p.name : '';
+  applyEq();
+});
+
+$('#shareEq').addEventListener('click', async () => {
+  const suggested = state.eqPreset === 'custom' ? eqCustomName : EQ_PRESETS[state.eqPreset].name;
+  const name = prompt('Как назвать пресет? Его увидят все пользователи.', suggested || '');
+  if (!name || !name.trim()) return;
+  try {
+    await api('/api/presets', { method: 'POST', body: JSON.stringify({ name: name.trim(), gains: state.eq }) });
+    await loadSharedPresets();
+  } catch (e) {
+    alert('Не получилось поделиться: ' + e.message);
+  }
+});
 
 let eqRedraw = 0;
 function applyEq() {
@@ -1368,7 +1552,7 @@ function renderEq() {
       seg.className = [lvl === 0 && 'zero', on && 'on', on && lvl < 0 && 'neg', on && lvl >= 9 && 'hot'].filter(Boolean).join(' ');
     });
   });
-  $('#eqName').textContent = state.eqPreset === 'custom' ? 'СВОЙ' : EQ_PRESETS[state.eqPreset].name.toUpperCase();
+  $('#eqName').textContent = state.eqPreset === 'custom' ? (eqCustomName || 'Свой').toUpperCase() : EQ_PRESETS[state.eqPreset].name.toUpperCase();
   $$('#eqPresets .chip').forEach((c) => c.classList.toggle('active', c.dataset.eq === state.eqPreset));
 }
 
@@ -1529,27 +1713,65 @@ window.addEventListener('drop', (e) => {
 });
 
 // ---------- Настройки между сессиями ----------
+// Всегда кэшируются в localStorage (чтобы страница стартовала мгновенно),
+// а в облачном режиме ещё и сохраняются в Turso — с небольшой задержкой, пачкой.
 const SETTINGS_KEY = 'mv-settings';
+let applyingSettings = false;
+let settingsTimer = 0;
+
+function currentSettings() {
+  return {
+    mode: state.mode, sens: state.sens, scale: state.scale, volume: state.volume,
+    preset: document.body.dataset.preset, eq: state.eq, eqPreset: state.eqPreset,
+    shuffle: player.shuffle, repeat: player.repeat, lastId: tracks[cur]?.id,
+  };
+}
+
 function save() {
-  try {
-    localStorage.setItem(SETTINGS_KEY, JSON.stringify({
-      mode: state.mode, sens: state.sens, scale: state.scale, volume: state.volume,
-      preset: document.body.dataset.preset, eq: state.eq, eqPreset: state.eqPreset,
-      shuffle: player.shuffle, repeat: player.repeat, lastId: tracks[cur]?.id,
-    }));
-  } catch {}
+  if (applyingSettings) return;
+  const s = currentSettings();
+  try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(s)); } catch {}
+  if (cloud) {
+    clearTimeout(settingsTimer);
+    settingsTimer = setTimeout(() => {
+      api('/api/settings', { method: 'PUT', body: JSON.stringify(s) }).catch((e) => console.warn('Настройки не сохранились в облако', e));
+    }, 800);
+  }
 }
 function readSettings() {
   try { return JSON.parse(localStorage.getItem(SETTINGS_KEY)) || {}; } catch { return {}; }
 }
 
+function applySettings(s, animate) {
+  applyingSettings = true;
+  try {
+    if (Array.isArray(s.eq) && s.eq.length === EQ_BANDS.length) state.eq = s.eq.map(Number);
+    if (s.eqPreset === 'custom' || EQ_PRESETS[s.eqPreset]) state.eqPreset = s.eqPreset;
+    if (typeof s.shuffle === 'boolean') player.shuffle = s.shuffle;
+    if (['off', 'all', 'one'].includes(s.repeat)) player.repeat = s.repeat;
+    if (s.volume != null) knobs.volume.input.value = s.volume;
+    if (s.sens) knobs.sens.input.value = s.sens;
+    if (s.scale) knobs.scale.input.value = s.scale;
+    knobs.volume.update();
+    knobs.sens.update();
+    knobs.scale.update();
+    setPreset(PRESETS.includes(s.preset) ? s.preset : document.body.dataset.preset || 'neon', animate);
+    if (MODES.includes(s.mode)) setMode(s.mode, animate);
+    eqNodes.forEach((f, i) => { f.gain.value = state.eq[i]; });
+    if (faders.length) { renderEq(); drawEqCurve(); }
+    renderPlayerModes();
+  } finally {
+    applyingSettings = false;
+  }
+  try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(currentSettings())); } catch {}
+}
+
 async function loadLibrary(lastId) {
   try {
-    const recs = await DB.all();
-    recs.sort((a, b) => a.added - b.added);
-    tracks = recs.map(withUrls);
+    tracks = await Library.load();
   } catch (e) {
-    console.warn('Плейлист из браузера не загрузился', e);
+    console.warn('Плейлист не загрузился', e);
+    $('#plStore').textContent = `Не удалось загрузить плейлист: ${e.message}`;
   }
   renderPlaylist();
   if (tracks.length && !state.loaded) {
@@ -1559,30 +1781,68 @@ async function loadLibrary(lastId) {
   updateDropzone();
 }
 
+function renderStoreInfo() {
+  $('#plStore').textContent = cloud
+    ? '☁ Плейлист и настройки — в облачной базе Turso, файлы — в Vercel Blob'
+    : 'Хранится в этом браузере';
+  $('#plStore').classList.toggle('cloud', cloud);
+  $('#plEmpty').textContent = cloud
+    ? 'Перетащи треки в окно или нажми «Добавить». Они загрузятся в облако и останутся после перезапуска.'
+    : 'Перетащи треки в окно или нажми «Добавить». Плейлист хранится в браузере и останется после перезапуска.';
+  $('#sharedBox').hidden = !cloud;
+}
+
+// Треки, сохранённые раньше в IndexedDB, можно одним нажатием перенести в облако
+async function offerMigration() {
+  let local = [];
+  try { local = await LocalDB.all(); } catch { return; }
+  const box = $('#plMigrate');
+  box.hidden = !local.length;
+  if (!local.length) return;
+  const n = local.length;
+  $('#plMigrateText').textContent = `В этом браузере сохранено ${n} ${plural(n, 'трек', 'трека', 'треков')} из старой версии.`;
+  $('#plMigrateBtn').onclick = async () => {
+    box.hidden = true;
+    local.sort((a, b) => a.added - b.added);
+    for (const r of local) {
+      const rec = withUrls(r);
+      tracks.push(rec);
+      renderPlaylist();
+      await Library.add(rec);
+      if (rec.status === 'saved') await LocalDB.del(r.id).catch(() => {});
+    }
+    updateDropzone();
+  };
+}
+
+async function initStorage(lastId) {
+  cloud = await detectCloud();
+  renderStoreInfo();
+  if (cloud) {
+    try {
+      const { settings } = await api('/api/settings');
+      if (settings) {
+        applySettings(settings, true);
+        lastId = settings.lastId ?? lastId;
+      }
+    } catch (e) {
+      console.warn('Настройки из облака не загрузились', e);
+    }
+    loadSharedPresets();
+  }
+  await loadLibrary(lastId);
+  if (cloud) offerMigration();
+}
+
 function boot() {
   const s = readSettings();
-  if (Array.isArray(s.eq) && s.eq.length === EQ_BANDS.length) state.eq = s.eq.map(Number);
-  if (s.eqPreset) state.eqPreset = s.eqPreset;
-  if (typeof s.shuffle === 'boolean') player.shuffle = s.shuffle;
-  if (['off', 'all', 'one'].includes(s.repeat)) player.repeat = s.repeat;
-  if (s.volume != null) knobs.volume.input.value = s.volume;
-  if (s.sens) knobs.sens.input.value = s.sens;
-  if (s.scale) knobs.scale.input.value = s.scale;
-  knobs.volume.update();
-  knobs.sens.update();
-  knobs.scale.update();
-
   initAudio();
-  setPreset(PRESETS.includes(s.preset) ? s.preset : 'neon', false);
-  if (MODES.includes(s.mode)) setMode(s.mode, false);
-
   buildEq();
-  renderEq();
-  drawEqCurve();
-  renderPlayerModes();
+  applySettings(s, false);
+  if (!PRESETS.includes(s.preset)) setPreset('neon', false);
   renderPlaylist();
   updateSourceUI();
-  loadLibrary(s.lastId);
+  initStorage(s.lastId);
 
   window.addEventListener('resize', resize);
   new ResizeObserver(resize).observe(stage);

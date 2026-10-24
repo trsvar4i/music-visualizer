@@ -1,5 +1,20 @@
-# Настройки редактора и инструментов
+# Секреты: ключи Turso и Vercel Blob хранятся только в переменных окружения
+.env
+.env*
+!.env.example
+
+# Локальная база для разработки и служебные файлы Vercel
+local.db*
+.vercel/
+.vercel
+
+# Зависимости
+node_modules/
+
+# Настройки редактора, инструментов и AI-агентов
 .claude/
+.agents/
+skills-lock.json
 .vscode/
 .idea/
 
@@ -7,6 +22,3 @@
 .DS_Store
 Thumbs.db
 desktop.ini
-
-# Зависимости, если появятся
-node_modules/

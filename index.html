@@ -92,6 +92,11 @@
               <button class="chip ghost" id="plClear">Очистить</button>
             </div>
           </div>
+          <p class="pl-store" id="plStore">Хранится в этом браузере</p>
+          <div class="pl-migrate" id="plMigrate" hidden>
+            <span id="plMigrateText"></span>
+            <button class="chip" id="plMigrateBtn">Перенести в облако</button>
+          </div>
           <ol class="pl-list" id="plList"></ol>
           <div class="pl-empty" id="plEmpty">
             Перетащи треки в окно или нажми «Добавить». Плейлист хранится в браузере и останется после перезапуска.
@@ -106,6 +111,14 @@
             </div>
             <div class="eq-faders" id="eqFaders"></div>
             <div class="eq-presets" id="eqPresets"></div>
+          </div>
+
+          <div class="shared" id="sharedBox" hidden>
+            <div class="shared-head">
+              <span>Пресеты сообщества</span>
+              <button class="chip" id="shareEq">Поделиться своим</button>
+            </div>
+            <div class="eq-presets" id="sharedPresets"></div>
           </div>
 
           <div class="knobs">
@@ -214,7 +227,8 @@
     </section>
   </div>
 
-  <audio id="audio" preload="auto"></audio>
+  <!-- crossorigin нужен, чтобы анализатор «слышал» треки из облачного хранилища -->
+  <audio id="audio" preload="auto" crossorigin="anonymous"></audio>
   <input type="file" id="file" accept="audio/*" multiple hidden>
   <script src="tags.js"></script>
   <script src="scenes.js"></script>

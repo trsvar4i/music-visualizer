@@ -1,0 +1,7 @@
+# Не выкладываем на Vercel то, что нужно только для разработки
+dev-server.js
+.env*
+local.db*
+.agents
+.claude
+skills-lock.json
